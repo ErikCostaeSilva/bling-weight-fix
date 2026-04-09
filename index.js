@@ -11,6 +11,9 @@ const BLING_CLIENT_SECRET = process.env.BLING_CLIENT_SECRET || "";
 const BLING_REDIRECT_URI =
   process.env.BLING_REDIRECT_URI || "https://bling-weight-fix.onrender.com/callback";
 
+let BLING_ACCESS_TOKEN = process.env.BLING_ACCESS_TOKEN || "";
+let BLING_REFRESH_TOKEN = process.env.BLING_REFRESH_TOKEN || "";
+
 const SKU_WEIGHT_FALLBACK_GRAMS = {
   "KIT-NOBUGS-CASA-SEGURA": 1250,
   "KIT-ZERO-INSETO": 950,
@@ -23,10 +26,7 @@ const SKU_WEIGHT_FALLBACK_GRAMS = {
   "NOBUGS-REPELENTE-FAMILY-100ML": 130,
 };
 
-// raw body para webhook Shopify
 app.use("/webhooks", express.raw({ type: "application/json" }));
-
-// json/urlencoded para demais rotas
 app.use(express.json());
 app.use(express.urlencoded({ extended: true }));
 
@@ -50,6 +50,101 @@ function getBlingBasicAuthHeader() {
   return `Basic ${Buffer.from(credentials).toString("base64")}`;
 }
 
+async function refreshBlingToken() {
+  const response = await fetch("https://www.bling.com.br/Api/v3/oauth/token", {
+    method: "POST",
+    headers: {
+      Authorization: getBlingBasicAuthHeader(),
+      "Content-Type": "application/x-www-form-urlencoded",
+    },
+    body: new URLSearchParams({
+      grant_type: "refresh_token",
+      refresh_token: BLING_REFRESH_TOKEN,
+    }).toString(),
+  });
+
+  const text = await response.text();
+
+  if (!response.ok) {
+    throw new Error(`Erro ao renovar token Bling: ${response.status} - ${text}`);
+  }
+
+  const data = JSON.parse(text);
+
+  BLING_ACCESS_TOKEN = data.access_token;
+  BLING_REFRESH_TOKEN = data.refresh_token || BLING_REFRESH_TOKEN;
+
+  console.log("Token do Bling renovado com sucesso.");
+  console.log("NOVO BLING_ACCESS_TOKEN:", BLING_ACCESS_TOKEN);
+  console.log("NOVO BLING_REFRESH_TOKEN:", BLING_REFRESH_TOKEN);
+
+  return data;
+}
+
+async function blingFetch(url, options = {}, retry = true) {
+  const response = await fetch(url, {
+    ...options,
+    headers: {
+      Authorization: `Bearer ${BLING_ACCESS_TOKEN}`,
+      Accept: "application/json",
+      ...(options.headers || {}),
+    },
+  });
+
+  if (response.status === 401 && retry) {
+    await refreshBlingToken();
+
+    return blingFetch(url, options, false);
+  }
+
+  return response;
+}
+
+async function findBlingOrderByShopifyNumber(orderNumberRaw) {
+  const orderNumber = String(orderNumberRaw).replace("#", "").trim();
+
+  const response = await blingFetch(
+    `https://api.bling.com.br/Api/v3/pedidos/vendas?numero=${encodeURIComponent(orderNumber)}`
+  );
+
+  const text = await response.text();
+
+  if (!response.ok) {
+    throw new Error(`Erro ao buscar pedido no Bling: ${response.status} - ${text}`);
+  }
+
+  const data = JSON.parse(text);
+  const pedido = data?.data?.[0];
+
+  return pedido || null;
+}
+
+async function updateBlingOrderWeight(orderId, weightKg) {
+  // Ajuste conforme o formato aceito na sua conta do Bling
+  const response = await blingFetch(
+    `https://api.bling.com.br/Api/v3/pedidos/vendas/${orderId}`,
+    {
+      method: "PUT",
+      headers: {
+        "Content-Type": "application/json",
+      },
+      body: JSON.stringify({
+        transporte: {
+          pesoBruto: weightKg,
+        },
+      }),
+    }
+  );
+
+  const text = await response.text();
+
+  if (!response.ok) {
+    throw new Error(`Erro ao atualizar pedido no Bling: ${response.status} - ${text}`);
+  }
+
+  return text;
+}
+
 app.get("/", (req, res) => {
   res.status(200).send("Servidor online");
 });
@@ -71,7 +166,7 @@ app.get("/start-auth", (req, res) => {
 });
 
 app.get("/callback", async (req, res) => {
-  const { code, state, error } = req.query;
+  const { code, error } = req.query;
 
   if (error) {
     return res.status(400).send(`Erro no retorno do Bling: ${error}`);
@@ -103,6 +198,9 @@ app.get("/callback", async (req, res) => {
 
     const data = JSON.parse(text);
 
+    BLING_ACCESS_TOKEN = data.access_token;
+    BLING_REFRESH_TOKEN = data.refresh_token;
+
     console.log("=== TOKENS BLING RECEBIDOS ===");
     console.log({
       access_token: data.access_token,
@@ -110,12 +208,9 @@ app.get("/callback", async (req, res) => {
       expires_in: data.expires_in,
       token_type: data.token_type,
       scope: data.scope,
-      state,
     });
 
-    return res.status(200).send(
-      "Autorização concluída. Veja os logs do Render para copiar access_token e refresh_token."
-    );
+    return res.status(200).send("Autorização concluída.");
   } catch (err) {
     console.error("Erro no callback do Bling:", err);
     return res.status(500).send("Erro interno no callback.");
@@ -146,7 +241,7 @@ app.post("/webhooks/orders-create", async (req, res) => {
   console.log("=== WEBHOOK RECEBIDO ===");
   console.log("Topic:", topic);
   console.log("Shop:", shop);
-  console.log("Pedido:", payload.name || payload.order_number || payload.id);
+  console.log("Pedido Shopify:", payload.name || payload.order_number || payload.id);
 
   const lineItems = payload.line_items || [];
 
@@ -187,7 +282,24 @@ app.post("/webhooks/orders-create", async (req, res) => {
   console.log("Peso total em gramas:", totalWeightGrams);
   console.log("Peso total em kg:", totalWeightKg);
 
-  return res.status(200).send("ok");
+  try {
+    const pedidoBling = await findBlingOrderByShopifyNumber(payload.name || payload.order_number);
+
+    if (!pedidoBling) {
+      console.warn("Pedido não encontrado no Bling.");
+      return res.status(200).send("ok - pedido não encontrado no Bling");
+    }
+
+    console.log("Pedido encontrado no Bling:", pedidoBling.id);
+
+    const result = await updateBlingOrderWeight(pedidoBling.id, totalWeightKg);
+    console.log("Pedido atualizado no Bling:", result);
+
+    return res.status(200).send("ok");
+  } catch (error) {
+    console.error("Erro ao sincronizar com Bling:", error);
+    return res.status(500).send("Erro ao sincronizar com Bling");
+  }
 });
 
 app.listen(PORT, () => {
