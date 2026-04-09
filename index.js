@@ -15,7 +15,16 @@ let BLING_ACCESS_TOKEN = process.env.BLING_ACCESS_TOKEN || "";
 let BLING_REFRESH_TOKEN = process.env.BLING_REFRESH_TOKEN || "";
 
 /**
- * Fallback por SKU somente quando a Shopify mandar grams = 0
+ * true  = não escreve no Bling, só simula e loga
+ * false = tenta escrever no Bling
+ *
+ * Deixa true por enquanto.
+ */
+const SIMULATION_MODE = true;
+
+/**
+ * Fallback por SKU em gramas.
+ * Só usa quando a Shopify mandar grams = 0.
  */
 const SKU_WEIGHT_FALLBACK_GRAMS = {
   "KIT-NOBUGS-CASA-SEGURA": 1250,
@@ -29,10 +38,10 @@ const SKU_WEIGHT_FALLBACK_GRAMS = {
   "NOBUGS-REPELENTE-FAMILY-100ML": 130,
 };
 
-// Raw body só no webhook Shopify
+// raw body só no webhook Shopify
 app.use("/webhooks", express.raw({ type: "application/json" }));
 
-// JSON/urlencoded para o restante
+// json/urlencoded para as demais rotas
 app.use(express.json());
 app.use(express.urlencoded({ extended: true }));
 
@@ -85,7 +94,9 @@ async function refreshBlingToken() {
   BLING_REFRESH_TOKEN = data.refresh_token || BLING_REFRESH_TOKEN;
 
   console.log("Token do Bling renovado com sucesso.");
-  console.log("ATENÇÃO: atualize essas env vars no Render manualmente se quiser persistir após restart.");
+  console.log(
+    "ATENÇÃO: atualize BLING_ACCESS_TOKEN e BLING_REFRESH_TOKEN no Render manualmente se quiser persistir após restart."
+  );
 
   return data;
 }
@@ -134,112 +145,6 @@ async function findBlingOrderByShopifyNumber(orderNumberRaw) {
 
   const data = JSON.parse(text);
   return data?.data?.[0] || null;
-}
-
-async function getBlingOrderById(orderId) {
-  const response = await blingFetch(
-    `https://api.bling.com.br/Api/v3/pedidos/vendas/${orderId}`
-  );
-
-  const text = await response.text();
-
-  if (!response.ok) {
-    throw new Error(`Erro ao buscar detalhes do pedido no Bling: ${response.status} - ${text}`);
-  }
-
-  const data = JSON.parse(text);
-  return data?.data || null;
-}
-
-/**
- * Remove campos inúteis/arriscados e preserva o essencial para o PUT do Bling.
- * Aqui está a parte mais sensível do fluxo.
- */
-function buildSafeBlingOrderPayload(orderData, weightKg) {
-  if (!orderData) {
-    throw new Error("Pedido do Bling ausente para montagem do payload.");
-  }
-
-  const payload = {};
-
-  // Campos básicos comuns
-  if (orderData.numero !== undefined) payload.numero = orderData.numero;
-  if (orderData.numeroLoja !== undefined) payload.numeroLoja = orderData.numeroLoja;
-  if (orderData.data !== undefined) payload.data = orderData.data;
-  if (orderData.dataSaida !== undefined) payload.dataSaida = orderData.dataSaida;
-  if (orderData.dataPrevista !== undefined) payload.dataPrevista = orderData.dataPrevista;
-  if (orderData.totalProdutos !== undefined) payload.totalProdutos = orderData.totalProdutos;
-  if (orderData.total !== undefined) payload.total = orderData.total;
-  if (orderData.contato !== undefined) payload.contato = orderData.contato;
-  if (orderData.situacao !== undefined) payload.situacao = orderData.situacao;
-  if (orderData.loja !== undefined) payload.loja = orderData.loja;
-  if (orderData.observacoes !== undefined) payload.observacoes = orderData.observacoes;
-  if (orderData.observacoesInternas !== undefined) payload.observacoesInternas = orderData.observacoesInternas;
-  if (orderData.desconto !== undefined) payload.desconto = orderData.desconto;
-  if (orderData.categoria !== undefined) payload.categoria = orderData.categoria;
-  if (orderData.outrasDespesas !== undefined) payload.outrasDespesas = orderData.outrasDespesas;
-
-  // Itens são obrigatórios no seu erro
-  payload.itens = Array.isArray(orderData.itens) ? orderData.itens : [];
-
-  if (!payload.itens.length) {
-    throw new Error("Pedido do Bling veio sem itens. Não é seguro atualizar.");
-  }
-
-  if (orderData.parcelas !== undefined) payload.parcelas = orderData.parcelas;
-  if (orderData.intermediador !== undefined) payload.intermediador = orderData.intermediador;
-  if (orderData.taxaComissao !== undefined) payload.taxaComissao = orderData.taxaComissao;
-  if (orderData.transporte !== undefined || weightKg !== undefined) {
-    payload.transporte = {
-      ...(orderData.transporte || {}),
-      pesoBruto: weightKg,
-    };
-  }
-
-  return payload;
-}
-
-async function updateBlingOrderWeight(orderId, weightKg) {
-  const pedidoCompleto = await getBlingOrderById(orderId);
-
-  if (!pedidoCompleto) {
-    throw new Error("Pedido completo não encontrado no Bling.");
-  }
-
-  const payload = buildSafeBlingOrderPayload(pedidoCompleto, weightKg);
-
-  console.log("Enviando atualização do pedido para o Bling...");
-  console.log(
-    JSON.stringify(
-      {
-        id: orderId,
-        numero: payload.numero,
-        itens: payload.itens?.length || 0,
-        pesoBruto: payload.transporte?.pesoBruto,
-      },
-      null,
-      2
-    )
-  );
-
-  const response = await blingFetch(
-    `https://api.bling.com.br/Api/v3/pedidos/vendas/${orderId}`,
-    {
-      method: "PUT",
-      headers: {
-        "Content-Type": "application/json",
-      },
-      body: JSON.stringify(payload),
-    }
-  );
-
-  const text = await response.text();
-
-  if (!response.ok) {
-    throw new Error(`Erro ao atualizar pedido no Bling: ${response.status} - ${text}`);
-  }
-
-  return text;
 }
 
 function calculateOrderWeight(lineItems) {
@@ -403,13 +308,26 @@ app.post("/webhooks/orders-create", async (req, res) => {
 
     console.log("Pedido encontrado no Bling:", pedidoBling.id);
 
-    const result = await updateBlingOrderWeight(pedidoBling.id, totalWeightKg);
-    console.log("Pedido atualizado no Bling:", result);
+    if (SIMULATION_MODE) {
+      console.log("=== MODO SIMULAÇÃO ATIVO ===");
+      console.log("Nenhuma alteração será enviada ao Bling.");
+      console.log({
+        pedidoBlingId: pedidoBling.id,
+        numeroPedidoShopify: payload.name || payload.order_number || payload.id,
+        pesoCalculadoKg: totalWeightKg,
+        itensRecebidos: lineItems.length,
+      });
 
-    return res.status(200).send("ok");
+      return res.status(200).send("ok - simulacao");
+    }
+
+    console.log(
+      "SIMULATION_MODE está false, mas a escrita automática no Bling foi removida desta versão por segurança."
+    );
+    return res.status(200).send("ok - escrita desativada por seguranca");
   } catch (error) {
-    console.error("Erro ao sincronizar com Bling:", error);
-    return res.status(500).send("Erro ao sincronizar com Bling");
+    console.error("Erro ao processar sincronização com Bling:", error);
+    return res.status(500).send("Erro ao processar sincronização com Bling");
   }
 });
 
