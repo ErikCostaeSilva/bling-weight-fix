@@ -14,6 +14,9 @@ const BLING_REDIRECT_URI =
 let BLING_ACCESS_TOKEN = process.env.BLING_ACCESS_TOKEN || "";
 let BLING_REFRESH_TOKEN = process.env.BLING_REFRESH_TOKEN || "";
 
+/**
+ * Fallback por SKU somente quando a Shopify mandar grams = 0
+ */
 const SKU_WEIGHT_FALLBACK_GRAMS = {
   "KIT-NOBUGS-CASA-SEGURA": 1250,
   "KIT-ZERO-INSETO": 950,
@@ -26,7 +29,10 @@ const SKU_WEIGHT_FALLBACK_GRAMS = {
   "NOBUGS-REPELENTE-FAMILY-100ML": 130,
 };
 
+// Raw body só no webhook Shopify
 app.use("/webhooks", express.raw({ type: "application/json" }));
+
+// JSON/urlencoded para o restante
 app.use(express.json());
 app.use(express.urlencoded({ extended: true }));
 
@@ -51,6 +57,10 @@ function getBlingBasicAuthHeader() {
 }
 
 async function refreshBlingToken() {
+  if (!BLING_REFRESH_TOKEN) {
+    throw new Error("BLING_REFRESH_TOKEN não configurado.");
+  }
+
   const response = await fetch("https://www.bling.com.br/Api/v3/oauth/token", {
     method: "POST",
     headers: {
@@ -75,13 +85,16 @@ async function refreshBlingToken() {
   BLING_REFRESH_TOKEN = data.refresh_token || BLING_REFRESH_TOKEN;
 
   console.log("Token do Bling renovado com sucesso.");
-  console.log("NOVO BLING_ACCESS_TOKEN:", BLING_ACCESS_TOKEN);
-  console.log("NOVO BLING_REFRESH_TOKEN:", BLING_REFRESH_TOKEN);
+  console.log("ATENÇÃO: atualize essas env vars no Render manualmente se quiser persistir após restart.");
 
   return data;
 }
 
 async function blingFetch(url, options = {}, retry = true) {
+  if (!BLING_ACCESS_TOKEN) {
+    throw new Error("BLING_ACCESS_TOKEN não configurado.");
+  }
+
   const response = await fetch(url, {
     ...options,
     headers: {
@@ -92,8 +105,8 @@ async function blingFetch(url, options = {}, retry = true) {
   });
 
   if (response.status === 401 && retry) {
+    console.warn("Access token expirado. Tentando renovar...");
     await refreshBlingToken();
-
     return blingFetch(url, options, false);
   }
 
@@ -101,7 +114,13 @@ async function blingFetch(url, options = {}, retry = true) {
 }
 
 async function findBlingOrderByShopifyNumber(orderNumberRaw) {
-  const orderNumber = String(orderNumberRaw).replace("#", "").trim();
+  const orderNumber = String(orderNumberRaw || "")
+    .replace("#", "")
+    .trim();
+
+  if (!orderNumber) {
+    throw new Error("Número do pedido Shopify inválido.");
+  }
 
   const response = await blingFetch(
     `https://api.bling.com.br/Api/v3/pedidos/vendas?numero=${encodeURIComponent(orderNumber)}`
@@ -114,13 +133,95 @@ async function findBlingOrderByShopifyNumber(orderNumberRaw) {
   }
 
   const data = JSON.parse(text);
-  const pedido = data?.data?.[0];
+  return data?.data?.[0] || null;
+}
 
-  return pedido || null;
+async function getBlingOrderById(orderId) {
+  const response = await blingFetch(
+    `https://api.bling.com.br/Api/v3/pedidos/vendas/${orderId}`
+  );
+
+  const text = await response.text();
+
+  if (!response.ok) {
+    throw new Error(`Erro ao buscar detalhes do pedido no Bling: ${response.status} - ${text}`);
+  }
+
+  const data = JSON.parse(text);
+  return data?.data || null;
+}
+
+/**
+ * Remove campos inúteis/arriscados e preserva o essencial para o PUT do Bling.
+ * Aqui está a parte mais sensível do fluxo.
+ */
+function buildSafeBlingOrderPayload(orderData, weightKg) {
+  if (!orderData) {
+    throw new Error("Pedido do Bling ausente para montagem do payload.");
+  }
+
+  const payload = {};
+
+  // Campos básicos comuns
+  if (orderData.numero !== undefined) payload.numero = orderData.numero;
+  if (orderData.numeroLoja !== undefined) payload.numeroLoja = orderData.numeroLoja;
+  if (orderData.data !== undefined) payload.data = orderData.data;
+  if (orderData.dataSaida !== undefined) payload.dataSaida = orderData.dataSaida;
+  if (orderData.dataPrevista !== undefined) payload.dataPrevista = orderData.dataPrevista;
+  if (orderData.totalProdutos !== undefined) payload.totalProdutos = orderData.totalProdutos;
+  if (orderData.total !== undefined) payload.total = orderData.total;
+  if (orderData.contato !== undefined) payload.contato = orderData.contato;
+  if (orderData.situacao !== undefined) payload.situacao = orderData.situacao;
+  if (orderData.loja !== undefined) payload.loja = orderData.loja;
+  if (orderData.observacoes !== undefined) payload.observacoes = orderData.observacoes;
+  if (orderData.observacoesInternas !== undefined) payload.observacoesInternas = orderData.observacoesInternas;
+  if (orderData.desconto !== undefined) payload.desconto = orderData.desconto;
+  if (orderData.categoria !== undefined) payload.categoria = orderData.categoria;
+  if (orderData.outrasDespesas !== undefined) payload.outrasDespesas = orderData.outrasDespesas;
+
+  // Itens são obrigatórios no seu erro
+  payload.itens = Array.isArray(orderData.itens) ? orderData.itens : [];
+
+  if (!payload.itens.length) {
+    throw new Error("Pedido do Bling veio sem itens. Não é seguro atualizar.");
+  }
+
+  if (orderData.parcelas !== undefined) payload.parcelas = orderData.parcelas;
+  if (orderData.intermediador !== undefined) payload.intermediador = orderData.intermediador;
+  if (orderData.taxaComissao !== undefined) payload.taxaComissao = orderData.taxaComissao;
+  if (orderData.transporte !== undefined || weightKg !== undefined) {
+    payload.transporte = {
+      ...(orderData.transporte || {}),
+      pesoBruto: weightKg,
+    };
+  }
+
+  return payload;
 }
 
 async function updateBlingOrderWeight(orderId, weightKg) {
-  // Ajuste conforme o formato aceito na sua conta do Bling
+  const pedidoCompleto = await getBlingOrderById(orderId);
+
+  if (!pedidoCompleto) {
+    throw new Error("Pedido completo não encontrado no Bling.");
+  }
+
+  const payload = buildSafeBlingOrderPayload(pedidoCompleto, weightKg);
+
+  console.log("Enviando atualização do pedido para o Bling...");
+  console.log(
+    JSON.stringify(
+      {
+        id: orderId,
+        numero: payload.numero,
+        itens: payload.itens?.length || 0,
+        pesoBruto: payload.transporte?.pesoBruto,
+      },
+      null,
+      2
+    )
+  );
+
   const response = await blingFetch(
     `https://api.bling.com.br/Api/v3/pedidos/vendas/${orderId}`,
     {
@@ -128,11 +229,7 @@ async function updateBlingOrderWeight(orderId, weightKg) {
       headers: {
         "Content-Type": "application/json",
       },
-      body: JSON.stringify({
-        transporte: {
-          pesoBruto: weightKg,
-        },
-      }),
+      body: JSON.stringify(payload),
     }
   );
 
@@ -143,6 +240,48 @@ async function updateBlingOrderWeight(orderId, weightKg) {
   }
 
   return text;
+}
+
+function calculateOrderWeight(lineItems) {
+  let totalWeightGrams = 0;
+  const debugItems = [];
+
+  for (const item of lineItems) {
+    const title = item.title || "";
+    const sku = item.sku || "";
+    const quantity = Number(item.quantity || 0);
+    const gramsFromShopify = Number(item.grams || 0);
+
+    let unitWeightGrams = 0;
+    let source = "none";
+
+    if (gramsFromShopify > 0) {
+      unitWeightGrams = gramsFromShopify;
+      source = "shopify_grams";
+    } else if (SKU_WEIGHT_FALLBACK_GRAMS[sku]) {
+      unitWeightGrams = SKU_WEIGHT_FALLBACK_GRAMS[sku];
+      source = "fallback_map";
+    }
+
+    const lineWeightGrams = unitWeightGrams * quantity;
+    totalWeightGrams += lineWeightGrams;
+
+    debugItems.push({
+      title,
+      sku,
+      quantity,
+      gramsFromShopify,
+      unitWeightGrams,
+      lineWeightGrams,
+      source,
+    });
+  }
+
+  return {
+    totalWeightGrams,
+    totalWeightKg: Number((totalWeightGrams / 1000).toFixed(3)),
+    debugItems,
+  };
 }
 
 app.get("/", (req, res) => {
@@ -203,12 +342,11 @@ app.get("/callback", async (req, res) => {
 
     console.log("=== TOKENS BLING RECEBIDOS ===");
     console.log({
-      access_token: data.access_token,
-      refresh_token: data.refresh_token,
       expires_in: data.expires_in,
       token_type: data.token_type,
       scope: data.scope,
     });
+    console.log("ATENÇÃO: salve os novos tokens nas env vars do Render.");
 
     return res.status(200).send("Autorização concluída.");
   } catch (err) {
@@ -244,46 +382,19 @@ app.post("/webhooks/orders-create", async (req, res) => {
   console.log("Pedido Shopify:", payload.name || payload.order_number || payload.id);
 
   const lineItems = payload.line_items || [];
+  const { totalWeightGrams, totalWeightKg, debugItems } = calculateOrderWeight(lineItems);
 
-  let totalWeightGrams = 0;
-
-  for (const item of lineItems) {
-    const sku = item.sku || "";
-    const quantity = Number(item.quantity || 0);
-    const gramsFromShopify = Number(item.grams || 0);
-
-    let unitWeightGrams = 0;
-    let source = "none";
-
-    if (gramsFromShopify > 0) {
-      unitWeightGrams = gramsFromShopify;
-      source = "shopify_grams";
-    } else if (SKU_WEIGHT_FALLBACK_GRAMS[sku]) {
-      unitWeightGrams = SKU_WEIGHT_FALLBACK_GRAMS[sku];
-      source = "fallback_map";
-    }
-
-    const lineWeightGrams = unitWeightGrams * quantity;
-    totalWeightGrams += lineWeightGrams;
-
-    console.log({
-      title: item.title || "",
-      sku,
-      quantity,
-      gramsFromShopify,
-      unitWeightGrams,
-      lineWeightGrams,
-      source,
-    });
+  for (const debugItem of debugItems) {
+    console.log(debugItem);
   }
-
-  const totalWeightKg = Number((totalWeightGrams / 1000).toFixed(3));
 
   console.log("Peso total em gramas:", totalWeightGrams);
   console.log("Peso total em kg:", totalWeightKg);
 
   try {
-    const pedidoBling = await findBlingOrderByShopifyNumber(payload.name || payload.order_number);
+    const pedidoBling = await findBlingOrderByShopifyNumber(
+      payload.name || payload.order_number || payload.id
+    );
 
     if (!pedidoBling) {
       console.warn("Pedido não encontrado no Bling.");
