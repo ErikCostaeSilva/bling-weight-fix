@@ -16,25 +16,22 @@ let BLING_REFRESH_TOKEN = process.env.BLING_REFRESH_TOKEN || "";
 
 /**
  * true  = não escreve no Bling
- * false = libera escrita futura
+ * false = reservar para escrita futura
  */
 const SIMULATION_MODE = true;
 
 /**
- * TTL em ms para deduplicação simples de webhook.
- * Evita reprocessar o mesmo event id no curto prazo.
+ * TTL em ms para deduplicação de webhook
  */
 const WEBHOOK_DEDUPE_TTL_MS = 60 * 60 * 1000;
 
 /**
- * Armazenamento em memória.
- * Observação: não persiste após restart do Render.
+ * Memória simples em runtime
  */
 const processedWebhookEvents = new Map();
 
 /**
- * Fallback por SKU em gramas.
- * Só entra quando a Shopify mandar grams = 0.
+ * Fallback por SKU em gramas
  */
 const SKU_WEIGHT_FALLBACK_GRAMS = {
   "KIT-NOBUGS-CASA-SEGURA": 1250,
@@ -48,10 +45,10 @@ const SKU_WEIGHT_FALLBACK_GRAMS = {
   "NOBUGS-REPELENTE-FAMILY-100ML": 130,
 };
 
-// raw body só para webhooks
+// raw body só para webhook Shopify
 app.use("/webhooks", express.raw({ type: "application/json" }));
 
-// json/urlencoded para as demais rotas
+// json/urlencoded para o resto
 app.use(express.json());
 app.use(express.urlencoded({ extended: true }));
 
@@ -72,7 +69,6 @@ function markWebhookEventProcessed(eventId) {
 
 function isWebhookEventAlreadyProcessed(eventId) {
   cleanupProcessedWebhookEvents();
-
   if (!eventId) return false;
   return processedWebhookEvents.has(eventId);
 }
@@ -286,17 +282,60 @@ function pickTransportDebug(orderData) {
   return result;
 }
 
-function extractVolumeFromOrder(orderData, volumeId) {
+function extractAllVolumesFromOrder(orderData) {
   const transportVolumes = Array.isArray(orderData?.transporte?.volumes)
     ? orderData.transporte.volumes
     : [];
 
-  const topLevelVolumes = Array.isArray(orderData?.volumes) ? orderData.volumes : [];
+  const topLevelVolumes = Array.isArray(orderData?.volumes)
+    ? orderData.volumes
+    : [];
 
   const allVolumes = [...transportVolumes, ...topLevelVolumes];
+
+  const uniqueMap = new Map();
+  for (const volume of allVolumes) {
+    if (volume?.id != null) {
+      uniqueMap.set(String(volume.id), volume);
+    }
+  }
+
+  return Array.from(uniqueMap.values());
+}
+
+function extractVolumeFromOrder(orderData, volumeId) {
+  const allVolumes = extractAllVolumesFromOrder(orderData);
   const volumeIdString = String(volumeId);
 
   return allVolumes.find((volume) => String(volume?.id) === volumeIdString) || null;
+}
+
+async function buildSnapshotByShopifyOrderNumber(orderNumberRaw) {
+  const pedidoBling = await findBlingOrderByShopifyNumber(orderNumberRaw);
+
+  if (!pedidoBling) {
+    return {
+      ok: false,
+      message: "Pedido não encontrado no Bling.",
+      numeroShopify: `#${normalizeShopifyOrderNumber(orderNumberRaw)}`,
+    };
+  }
+
+  const pedidoCompleto = await getBlingOrderById(pedidoBling.id);
+  const debug = pickTransportDebug(pedidoCompleto);
+  const allVolumes = extractAllVolumesFromOrder(pedidoCompleto);
+
+  return {
+    ok: true,
+    numeroShopify: `#${normalizeShopifyOrderNumber(orderNumberRaw)}`,
+    pedidoBlingId: pedidoBling.id,
+    numeroBling: pedidoCompleto?.numero ?? null,
+    numeroLoja: pedidoCompleto?.numeroLoja ?? null,
+    situacao: pedidoCompleto?.situacao ?? null,
+    transporte: pedidoCompleto?.transporte ?? null,
+    volumes: allVolumes,
+    debug,
+  };
 }
 
 app.get("/", (req, res) => {
@@ -386,17 +425,13 @@ app.get("/callback", async (req, res) => {
 app.get("/debug/pedido/:numeroShopify", async (req, res) => {
   try {
     const numeroShopify = String(req.params.numeroShopify || "").trim();
-    const numeroComHash = numeroShopify.startsWith("#")
-      ? numeroShopify
-      : `#${numeroShopify}`;
-
-    const pedidoBling = await findBlingOrderByShopifyNumber(numeroComHash);
+    const pedidoBling = await findBlingOrderByShopifyNumber(numeroShopify);
 
     if (!pedidoBling) {
       return res.status(404).json({
         ok: false,
         message: "Pedido não encontrado no Bling.",
-        numeroShopify: numeroComHash,
+        numeroShopify: `#${normalizeShopifyOrderNumber(numeroShopify)}`,
       });
     }
 
@@ -408,7 +443,7 @@ app.get("/debug/pedido/:numeroShopify", async (req, res) => {
 
     return res.status(200).json({
       ok: true,
-      numeroShopify: numeroComHash,
+      numeroShopify: `#${normalizeShopifyOrderNumber(numeroShopify)}`,
       pedidoBlingId: pedidoBling.id,
       debug: debugData,
     });
@@ -422,8 +457,7 @@ app.get("/debug/pedido/:numeroShopify", async (req, res) => {
 });
 
 /**
- * Debug de volume a partir do pedido Shopify.
- * Uso:
+ * Exemplo:
  * /debug/volume/15853758446?numeroShopify=1065
  */
 app.get("/debug/volume/:volumeId", async (req, res) => {
@@ -445,17 +479,13 @@ app.get("/debug/volume/:volumeId", async (req, res) => {
       });
     }
 
-    const numeroComHash = numeroShopify.startsWith("#")
-      ? numeroShopify
-      : `#${numeroShopify}`;
-
-    const pedidoBling = await findBlingOrderByShopifyNumber(numeroComHash);
+    const pedidoBling = await findBlingOrderByShopifyNumber(numeroShopify);
 
     if (!pedidoBling) {
       return res.status(404).json({
         ok: false,
         message: "Pedido não encontrado no Bling.",
-        numeroShopify: numeroComHash,
+        numeroShopify: `#${normalizeShopifyOrderNumber(numeroShopify)}`,
       });
     }
 
@@ -466,37 +496,50 @@ app.get("/debug/volume/:volumeId", async (req, res) => {
       return res.status(404).json({
         ok: false,
         message: "Volume não encontrado dentro do pedido.",
-        numeroShopify: numeroComHash,
+        numeroShopify: `#${normalizeShopifyOrderNumber(numeroShopify)}`,
         pedidoBlingId: pedidoBling.id,
         volumeId,
       });
     }
 
-    console.log("=== DEBUG VOLUME BLING ===");
-    console.log(
-      JSON.stringify(
-        {
-          numeroShopify: numeroComHash,
-          pedidoBlingId: pedidoBling.id,
-          volumeId,
-          volume,
-          transporte: pedidoCompleto?.transporte || null,
-        },
-        null,
-        2
-      )
-    );
-
-    return res.status(200).json({
+    const responseData = {
       ok: true,
-      numeroShopify: numeroComHash,
+      numeroShopify: `#${normalizeShopifyOrderNumber(numeroShopify)}`,
       pedidoBlingId: pedidoBling.id,
       volumeId,
       volume,
       transporte: pedidoCompleto?.transporte || null,
-    });
+    };
+
+    console.log("=== DEBUG VOLUME BLING ===");
+    console.log(JSON.stringify(responseData, null, 2));
+
+    return res.status(200).json(responseData);
   } catch (error) {
     console.error("Erro no debug do volume:", error);
+    return res.status(500).json({
+      ok: false,
+      message: error.message,
+    });
+  }
+});
+
+/**
+ * Snapshot completo do pedido + transporte + volumes.
+ * Exemplo:
+ * /snapshot/1065
+ */
+app.get("/snapshot/:numeroShopify", async (req, res) => {
+  try {
+    const numeroShopify = String(req.params.numeroShopify || "").trim();
+    const snapshot = await buildSnapshotByShopifyOrderNumber(numeroShopify);
+
+    console.log("=== SNAPSHOT PEDIDO BLING ===");
+    console.log(JSON.stringify(snapshot, null, 2));
+
+    return res.status(snapshot.ok ? 200 : 404).json(snapshot);
+  } catch (error) {
+    console.error("Erro no snapshot do pedido:", error);
     return res.status(500).json({
       ok: false,
       message: error.message,
