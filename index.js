@@ -15,16 +15,13 @@ let BLING_ACCESS_TOKEN = process.env.BLING_ACCESS_TOKEN || "";
 let BLING_REFRESH_TOKEN = process.env.BLING_REFRESH_TOKEN || "";
 
 /**
- * true  = não escreve no Bling, só simula e loga
- * false = tenta escrever no Bling
- *
- * Deixa true por enquanto.
+ * true  = não escreve no Bling
+ * false = habilita escrita futura
  */
 const SIMULATION_MODE = true;
 
 /**
- * Fallback por SKU em gramas.
- * Só usa quando a Shopify mandar grams = 0.
+ * Fallback por SKU em gramas
  */
 const SKU_WEIGHT_FALLBACK_GRAMS = {
   "KIT-NOBUGS-CASA-SEGURA": 1250,
@@ -38,10 +35,10 @@ const SKU_WEIGHT_FALLBACK_GRAMS = {
   "NOBUGS-REPELENTE-FAMILY-100ML": 130,
 };
 
-// raw body só no webhook Shopify
+// raw body só para webhook
 app.use("/webhooks", express.raw({ type: "application/json" }));
 
-// json/urlencoded para as demais rotas
+// json/urlencoded para demais rotas
 app.use(express.json());
 app.use(express.urlencoded({ extended: true }));
 
@@ -147,6 +144,21 @@ async function findBlingOrderByShopifyNumber(orderNumberRaw) {
   return data?.data?.[0] || null;
 }
 
+async function getBlingOrderById(orderId) {
+  const response = await blingFetch(
+    `https://api.bling.com.br/Api/v3/pedidos/vendas/${orderId}`
+  );
+
+  const text = await response.text();
+
+  if (!response.ok) {
+    throw new Error(`Erro ao buscar detalhes do pedido no Bling: ${response.status} - ${text}`);
+  }
+
+  const data = JSON.parse(text);
+  return data?.data || null;
+}
+
 function calculateOrderWeight(lineItems) {
   let totalWeightGrams = 0;
   const debugItems = [];
@@ -187,6 +199,52 @@ function calculateOrderWeight(lineItems) {
     totalWeightKg: Number((totalWeightGrams / 1000).toFixed(3)),
     debugItems,
   };
+}
+
+function pickTransportDebug(orderData) {
+  if (!orderData || typeof orderData !== "object") return null;
+
+  const result = {
+    id: orderData.id ?? null,
+    numero: orderData.numero ?? null,
+    numeroLoja: orderData.numeroLoja ?? null,
+    situacao: orderData.situacao ?? null,
+    loja: orderData.loja ?? null,
+    transporte: orderData.transporte ?? null,
+    volumes: orderData.volumes ?? null,
+    parcelas: orderData.parcelas ?? null,
+    camposRelacionados: {},
+  };
+
+  const interestingKeys = [
+    "transporte",
+    "transportador",
+    "volumes",
+    "volume",
+    "objeto",
+    "objetos",
+    "postagem",
+    "postagens",
+    "remessa",
+    "remessas",
+    "rastreamento",
+    "tracking",
+    "etiqueta",
+    "etiquetas",
+    "logistica",
+    "logisticas",
+    "servico",
+    "servicos",
+  ];
+
+  for (const [key, value] of Object.entries(orderData)) {
+    const normalized = key.toLowerCase();
+    if (interestingKeys.some((term) => normalized.includes(term))) {
+      result.camposRelacionados[key] = value;
+    }
+  }
+
+  return result;
 }
 
 app.get("/", (req, res) => {
@@ -260,6 +318,44 @@ app.get("/callback", async (req, res) => {
   }
 });
 
+app.get("/debug/pedido/:numeroShopify", async (req, res) => {
+  try {
+    const numeroShopify = String(req.params.numeroShopify || "").trim();
+    const numeroComHash = numeroShopify.startsWith("#")
+      ? numeroShopify
+      : `#${numeroShopify}`;
+
+    const pedidoBling = await findBlingOrderByShopifyNumber(numeroComHash);
+
+    if (!pedidoBling) {
+      return res.status(404).json({
+        ok: false,
+        message: "Pedido não encontrado no Bling.",
+        numeroShopify: numeroComHash,
+      });
+    }
+
+    const pedidoCompleto = await getBlingOrderById(pedidoBling.id);
+    const debugData = pickTransportDebug(pedidoCompleto);
+
+    console.log("=== DEBUG PEDIDO BLING ===");
+    console.log(JSON.stringify(debugData, null, 2));
+
+    return res.status(200).json({
+      ok: true,
+      numeroShopify: numeroComHash,
+      pedidoBlingId: pedidoBling.id,
+      debug: debugData,
+    });
+  } catch (error) {
+    console.error("Erro no debug do pedido:", error);
+    return res.status(500).json({
+      ok: false,
+      message: error.message,
+    });
+  }
+});
+
 app.post("/webhooks/orders-create", async (req, res) => {
   const hmacHeader = req.get("x-shopify-hmac-sha256");
   const topic = req.get("x-shopify-topic");
@@ -321,10 +417,8 @@ app.post("/webhooks/orders-create", async (req, res) => {
       return res.status(200).send("ok - simulacao");
     }
 
-    console.log(
-      "SIMULATION_MODE está false, mas a escrita automática no Bling foi removida desta versão por segurança."
-    );
-    return res.status(200).send("ok - escrita desativada por seguranca");
+    console.log("Escrita automática desativada nesta versão por segurança.");
+    return res.status(200).send("ok - escrita desativada");
   } catch (error) {
     console.error("Erro ao processar sincronização com Bling:", error);
     return res.status(500).send("Erro ao processar sincronização com Bling");
