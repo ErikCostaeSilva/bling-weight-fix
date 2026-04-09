@@ -16,12 +16,25 @@ let BLING_REFRESH_TOKEN = process.env.BLING_REFRESH_TOKEN || "";
 
 /**
  * true  = não escreve no Bling
- * false = habilita escrita futura
+ * false = libera escrita futura
  */
 const SIMULATION_MODE = true;
 
 /**
- * Fallback por SKU em gramas
+ * TTL em ms para deduplicação simples de webhook.
+ * Evita reprocessar o mesmo event id no curto prazo.
+ */
+const WEBHOOK_DEDUPE_TTL_MS = 60 * 60 * 1000;
+
+/**
+ * Armazenamento em memória.
+ * Observação: não persiste após restart do Render.
+ */
+const processedWebhookEvents = new Map();
+
+/**
+ * Fallback por SKU em gramas.
+ * Só entra quando a Shopify mandar grams = 0.
  */
 const SKU_WEIGHT_FALLBACK_GRAMS = {
   "KIT-NOBUGS-CASA-SEGURA": 1250,
@@ -35,12 +48,34 @@ const SKU_WEIGHT_FALLBACK_GRAMS = {
   "NOBUGS-REPELENTE-FAMILY-100ML": 130,
 };
 
-// raw body só para webhook
+// raw body só para webhooks
 app.use("/webhooks", express.raw({ type: "application/json" }));
 
-// json/urlencoded para demais rotas
+// json/urlencoded para as demais rotas
 app.use(express.json());
 app.use(express.urlencoded({ extended: true }));
+
+function cleanupProcessedWebhookEvents() {
+  const now = Date.now();
+
+  for (const [eventId, timestamp] of processedWebhookEvents.entries()) {
+    if (now - timestamp > WEBHOOK_DEDUPE_TTL_MS) {
+      processedWebhookEvents.delete(eventId);
+    }
+  }
+}
+
+function markWebhookEventProcessed(eventId) {
+  cleanupProcessedWebhookEvents();
+  processedWebhookEvents.set(eventId, Date.now());
+}
+
+function isWebhookEventAlreadyProcessed(eventId) {
+  cleanupProcessedWebhookEvents();
+
+  if (!eventId) return false;
+  return processedWebhookEvents.has(eventId);
+}
 
 function verifyShopifyWebhook(rawBodyBuffer, hmacHeader) {
   if (!hmacHeader || !SHOPIFY_WEBHOOK_SECRET) return false;
@@ -121,14 +156,18 @@ async function blingFetch(url, options = {}, retry = true) {
   return response;
 }
 
-async function findBlingOrderByShopifyNumber(orderNumberRaw) {
-  const orderNumber = String(orderNumberRaw || "")
-    .replace("#", "")
-    .trim();
+function normalizeShopifyOrderNumber(orderNumberRaw) {
+  const normalized = String(orderNumberRaw || "").replace("#", "").trim();
 
-  if (!orderNumber) {
+  if (!normalized) {
     throw new Error("Número do pedido Shopify inválido.");
   }
+
+  return normalized;
+}
+
+async function findBlingOrderByShopifyNumber(orderNumberRaw) {
+  const orderNumber = normalizeShopifyOrderNumber(orderNumberRaw);
 
   const response = await blingFetch(
     `https://api.bling.com.br/Api/v3/pedidos/vendas?numero=${encodeURIComponent(orderNumber)}`
@@ -247,8 +286,34 @@ function pickTransportDebug(orderData) {
   return result;
 }
 
+function extractVolumeFromOrder(orderData, volumeId) {
+  const transportVolumes = Array.isArray(orderData?.transporte?.volumes)
+    ? orderData.transporte.volumes
+    : [];
+
+  const topLevelVolumes = Array.isArray(orderData?.volumes) ? orderData.volumes : [];
+
+  const allVolumes = [...transportVolumes, ...topLevelVolumes];
+  const volumeIdString = String(volumeId);
+
+  return allVolumes.find((volume) => String(volume?.id) === volumeIdString) || null;
+}
+
 app.get("/", (req, res) => {
   res.status(200).send("Servidor online");
+});
+
+app.get("/health", (req, res) => {
+  res.status(200).json({
+    ok: true,
+    simulationMode: SIMULATION_MODE,
+    hasShopifySecret: Boolean(SHOPIFY_WEBHOOK_SECRET),
+    hasBlingClientId: Boolean(BLING_CLIENT_ID),
+    hasBlingClientSecret: Boolean(BLING_CLIENT_SECRET),
+    hasBlingAccessToken: Boolean(BLING_ACCESS_TOKEN),
+    hasBlingRefreshToken: Boolean(BLING_REFRESH_TOKEN),
+    processedWebhookEventsCount: processedWebhookEvents.size,
+  });
 });
 
 app.get("/start-auth", (req, res) => {
@@ -356,10 +421,94 @@ app.get("/debug/pedido/:numeroShopify", async (req, res) => {
   }
 });
 
+/**
+ * Debug de volume a partir do pedido Shopify.
+ * Uso:
+ * /debug/volume/15853758446?numeroShopify=1065
+ */
+app.get("/debug/volume/:volumeId", async (req, res) => {
+  try {
+    const volumeId = String(req.params.volumeId || "").trim();
+    const numeroShopify = String(req.query.numeroShopify || "").trim();
+
+    if (!volumeId) {
+      return res.status(400).json({
+        ok: false,
+        message: "volumeId é obrigatório.",
+      });
+    }
+
+    if (!numeroShopify) {
+      return res.status(400).json({
+        ok: false,
+        message: "numeroShopify é obrigatório na query string. Exemplo: ?numeroShopify=1065",
+      });
+    }
+
+    const numeroComHash = numeroShopify.startsWith("#")
+      ? numeroShopify
+      : `#${numeroShopify}`;
+
+    const pedidoBling = await findBlingOrderByShopifyNumber(numeroComHash);
+
+    if (!pedidoBling) {
+      return res.status(404).json({
+        ok: false,
+        message: "Pedido não encontrado no Bling.",
+        numeroShopify: numeroComHash,
+      });
+    }
+
+    const pedidoCompleto = await getBlingOrderById(pedidoBling.id);
+    const volume = extractVolumeFromOrder(pedidoCompleto, volumeId);
+
+    if (!volume) {
+      return res.status(404).json({
+        ok: false,
+        message: "Volume não encontrado dentro do pedido.",
+        numeroShopify: numeroComHash,
+        pedidoBlingId: pedidoBling.id,
+        volumeId,
+      });
+    }
+
+    console.log("=== DEBUG VOLUME BLING ===");
+    console.log(
+      JSON.stringify(
+        {
+          numeroShopify: numeroComHash,
+          pedidoBlingId: pedidoBling.id,
+          volumeId,
+          volume,
+          transporte: pedidoCompleto?.transporte || null,
+        },
+        null,
+        2
+      )
+    );
+
+    return res.status(200).json({
+      ok: true,
+      numeroShopify: numeroComHash,
+      pedidoBlingId: pedidoBling.id,
+      volumeId,
+      volume,
+      transporte: pedidoCompleto?.transporte || null,
+    });
+  } catch (error) {
+    console.error("Erro no debug do volume:", error);
+    return res.status(500).json({
+      ok: false,
+      message: error.message,
+    });
+  }
+});
+
 app.post("/webhooks/orders-create", async (req, res) => {
   const hmacHeader = req.get("x-shopify-hmac-sha256");
   const topic = req.get("x-shopify-topic");
   const shop = req.get("x-shopify-shop-domain");
+  const eventId = req.get("x-shopify-event-id");
 
   const rawBody = req.body;
   const valid = verifyShopifyWebhook(rawBody, hmacHeader);
@@ -367,6 +516,11 @@ app.post("/webhooks/orders-create", async (req, res) => {
   if (!valid) {
     console.error("Webhook inválido");
     return res.status(401).send("Unauthorized");
+  }
+
+  if (eventId && isWebhookEventAlreadyProcessed(eventId)) {
+    console.warn("Webhook duplicado ignorado:", eventId);
+    return res.status(200).send("ok - webhook duplicado ignorado");
   }
 
   let payload;
@@ -377,7 +531,12 @@ app.post("/webhooks/orders-create", async (req, res) => {
     return res.status(400).send("Invalid JSON");
   }
 
+  if (eventId) {
+    markWebhookEventProcessed(eventId);
+  }
+
   console.log("=== WEBHOOK RECEBIDO ===");
+  console.log("Event ID:", eventId || "sem-event-id");
   console.log("Topic:", topic);
   console.log("Shop:", shop);
   console.log("Pedido Shopify:", payload.name || payload.order_number || payload.id);
